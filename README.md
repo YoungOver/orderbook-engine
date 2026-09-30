@@ -1,102 +1,120 @@
 # orderbook-engine
 
-A limit order book and matching engine in Go, built the way exchanges build them: one single-writer loop per instrument, an append-only journal with group commit, and a market data stream that can never slow matching down.
+Книга заявок и движок сопоставления на Go, устроенные так, как их делают биржи: один
+однопоточный цикл на инструмент, журнал только на дозапись с групповым коммитом и поток
+рыночных данных, который никогда не тормозит сопоставление.
 
 ![ci](https://github.com/YoungOver/orderbook-engine/actions/workflows/ci.yml/badge.svg)
 ![go](https://img.shields.io/badge/go-1.25-00ADD8)
 
-![benchmarks](docs/bench.png)
+![Бенчмарки](docs/bench.png)
 
-| Layer | Result | How it was measured |
+| Уровень | Результат | Как измерено |
 |---|---|---|
-| Book core | **3.62M orders/s**, 0 allocs/op | `go test -bench SubmitMixed`, one core |
-| Engine, 4 symbols | **1.01M commands/s** | `go test -bench EngineParallel`, 16 goroutines |
-| HTTP/JSON, async journal | **95.6k req/s**, p99 4.9 ms | `cmd/loadgen`, 128 keep-alive conns, same laptop |
-| HTTP/JSON, fsync every batch | **28.9k req/s**, p99 6.1 ms | same, 25.6 commands per fsync on average |
-| Cold start | **433k records replayed in 96 ms** | server log after restart |
+| Ядро книги | **3,62 млн заявок/с**, 0 аллокаций на операцию | `go test -bench SubmitMixed`, одно ядро |
+| Движок, 4 инструмента | **1,01 млн команд/с** | `go test -bench EngineParallel`, 16 горутин |
+| HTTP/JSON, асинхронный журнал | **95,6 тыс. запросов/с**, p99 4,9 мс | `cmd/loadgen`, 128 keep-alive соединений, тот же ноутбук |
+| HTTP/JSON, fsync на каждый пакет | **28,9 тыс. запросов/с**, p99 6,1 мс | то же, в среднем 25,6 команды на один fsync |
+| Холодный старт | **433 тыс. записей проигрываются за 96 мс** | лог сервера после перезапуска |
 
-Hardware: Intel i7-13620H laptop, Windows 11, load generator on the same machine. Numbers on a Linux box with the client on a separate host are higher.
+Железо: ноутбук Intel i7-13620H, Windows 11, генератор нагрузки на той же машине. На Linux с
+клиентом на отдельной машине цифры выше.
 
-## Why it is fast
+## Почему быстро
 
-- **No locks on the hot path.** Each symbol is owned by exactly one goroutine. HTTP handlers only enqueue commands and wait for a reply channel taken from a `sync.Pool`.
-- **Price-time priority with O(1) cancel.** Price levels live in two heaps (max for bids, min for asks). Orders inside a level form an intrusive doubly linked list, so cancelling never scans.
-- **Integer ticks and lots.** No floating point anywhere in matching, which also makes the journal bit-exact across replays.
-- **Object pooling.** Filled and cancelled orders go back into a free list, the benchmark shows zero allocations per submit.
-- **Group commit.** The loop drains up to 512 queued commands, writes them with a single syscall and one `fsync`, then applies them. Durability costs one disk flush per batch instead of per order.
-- **Backpressure instead of latency collapse.** Queues are bounded. When a symbol is saturated the API answers `429` right away and `obe_rejected_total` grows.
+- **Без блокировок на горячем пути.** Каждым инструментом владеет ровно одна горутина.
+  HTTP-обработчики только ставят команду в очередь и ждут ответ в канале из `sync.Pool`.
+- **Приоритет цены и времени, отмена за O(1).** Ценовые уровни лежат в двух кучах
+  (максимум для покупок, минимум для продаж). Заявки внутри уровня образуют встроенный
+  двусвязный список, поэтому отмена ничего не перебирает.
+- **Целые тики и лоты.** В сопоставлении нигде нет плавающей точки, поэтому журнал
+  воспроизводится бит в бит.
+- **Пул объектов.** Исполненные и отменённые заявки возвращаются в список свободных,
+  бенчмарк показывает ноль аллокаций на заявку.
+- **Групповой коммит.** Цикл забирает до 512 команд из очереди, пишет их одним системным
+  вызовом и одним `fsync`, затем применяет. Сохранность стоит один сброс на диск на пакет,
+  а не на заявку.
+- **Обратное давление вместо обвала задержки.** Очереди ограничены. Когда инструмент
+  перегружен, API сразу отвечает `429`, и растёт `obe_rejected_total`.
 
-## Architecture
+## Архитектура
 
 ```mermaid
 flowchart LR
-    C[Clients] -->|POST /v1/orders| API[HTTP API]
-    API -->|bounded chan| L1[BTC-USDT loop]
-    API -->|bounded chan| L2[ETH-USDT loop]
-    L1 -->|batch append + fsync| J[(journal.bin)]
-    L2 -->|batch append + fsync| J
-    L1 --> B1[order book]
-    L2 --> B2[order book]
-    L1 -->|trades| H[Feed hub]
-    L2 -->|trades| H
-    H -->|text/event-stream| S[Subscribers]
+    C[Клиенты] -->|POST /v1/orders| API[HTTP API]
+    API -->|ограниченный канал| L1[цикл BTC-USDT]
+    API -->|ограниченный канал| L2[цикл ETH-USDT]
+    L1 -->|пакетная запись + fsync| J[(journal.bin)]
+    L2 -->|пакетная запись + fsync| J
+    L1 --> B1[книга заявок]
+    L2 --> B2[книга заявок]
+    L1 -->|сделки| H[Рассылка]
+    L2 -->|сделки| H
+    H -->|text/event-stream| S[Подписчики]
     API --> M[/metrics/]
 ```
 
-## Durability and recovery
+## Сохранность и восстановление
 
-Every record is `len | crc32c | body`. On start the engine replays the journal into fresh books before accepting traffic. If the process died in the middle of an append, the torn tail fails the CRC check and is truncated, so the book never contains half an order. `TestJournalReplayRestoresBook` and `TestRoundTripAndTornTail` cover both paths.
+Каждая запись имеет вид `len | crc32c | body`. При старте движок проигрывает журнал в новые
+книги, прежде чем принимать трафик. Если процесс упал посреди записи, оборванный хвост не
+проходит проверку CRC и обрезается, поэтому в книге никогда не окажется половины заявки.
+Оба пути покрывают `TestJournalReplayRestoresBook` и `TestRoundTripAndTornTail`.
 
-## Correctness
+## Корректность
 
-`TestConservation` runs 200k random submits and cancels and checks that quantity is never created or lost: submitted = 2 × filled + cancelled + resting. The matching tests pin price-time priority, IOC and market order behaviour.
+`TestConservation` прогоняет 200 тыс. случайных заявок и отмен и проверяет, что количество
+не появляется и не пропадает: выставлено = 2 × исполнено + отменено + в книге. Тесты
+сопоставления фиксируют приоритет цены и времени, поведение IOC и рыночных заявок.
 
 ## API
 
 ```bash
-# place a limit order (price in ticks, qty in lots)
+# лимитная заявка (цена в тиках, количество в лотах)
 curl -X POST localhost:8080/v1/orders -d '{"symbol":"BTC-USDT","side":"buy","type":"limit","price":10000,"qty":5}'
 
-# cancel
+# отмена
 curl -X DELETE localhost:8080/v1/orders/BTC-USDT/42
 
-# aggregated depth
+# агрегированный стакан
 curl 'localhost:8080/v1/book/BTC-USDT?levels=10'
 
-# live trades
+# сделки в реальном времени
 curl -N 'localhost:8080/v1/stream?symbol=BTC-USDT'
 ```
 
-Order types: `limit`, `ioc`, `market`.
+Типы заявок: `limit`, `ioc`, `market`.
 
-## Observability
+## Наблюдаемость
 
-Prometheus metrics at `/metrics`: commands, trades, rejected commands, group-commit batches, SSE subscribers and a latency histogram per route. `docker compose up` starts the engine, Prometheus and a provisioned Grafana dashboard on `localhost:3000`.
+Метрики Prometheus на `/metrics`: команды, сделки, отклонённые команды, пакеты группового
+коммита, подписчики SSE и гистограмма задержек по маршрутам. `docker compose up` поднимает
+движок, Prometheus и готовый дашборд Grafana на `localhost:3000`.
 
-## Run
+## Запуск
 
 ```bash
-make run      # server on :8080
-make test     # unit tests with the race detector
-make bench    # micro benchmarks
-make load     # HTTP load test with latency percentiles
-make up       # engine + Prometheus + Grafana
+make run      # сервер на :8080
+make test     # юнит-тесты с детектором гонок
+make bench    # микробенчмарки
+make load     # нагрузочный тест по HTTP с перцентилями задержки
+make up       # движок + Prometheus + Grafana
 ```
 
-## Layout
+## Раскладка
 
 ```
-cmd/server     entrypoint, flags, graceful shutdown
-cmd/loadgen    closed-loop load generator with p50..p99.9
-internal/book  order book and matching
-internal/engine single-writer loops, batching, backpressure
-internal/journal CRC-protected command log with torn-write recovery
-internal/feed  non-blocking SSE fan-out
-internal/api   HTTP handlers and Prometheus instrumentation
+cmd/server       точка входа, флаги, корректное завершение
+cmd/loadgen      генератор нагрузки с замкнутым циклом, p50..p99.9
+internal/book    книга заявок и сопоставление
+internal/engine  однопоточные циклы, пакеты, обратное давление
+internal/journal журнал команд с CRC и восстановлением оборванных записей
+internal/feed    неблокирующая рассылка SSE
+internal/api     HTTP-обработчики и метрики Prometheus
 ```
 
-## Roadmap
+## Дальше
 
-- Snapshots every N records to cap replay time
-- Binary protocol over TCP next to JSON for co-located clients
-- Replication of the journal to a hot standby
+- Снимки состояния каждые N записей, чтобы ограничить время проигрывания
+- Бинарный протокол поверх TCP рядом с JSON для клиентов в той же стойке
+- Репликация журнала на горячий резерв
